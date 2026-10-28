@@ -488,6 +488,73 @@ impl LocalBufferStore {
                 cx,
             );
         }
+
+        // Recreated ignored directories are unloaded, so their open descendants
+        // receive no entry updates until we explicitly scan their paths again.
+        let unloaded_directories = changes
+            .iter()
+            .filter_map(|(_, entry_id, change)| {
+                if matches!(change, PathChange::Removed | PathChange::Loaded) {
+                    return None;
+                }
+                let entry = snapshot.entry_for_id(*entry_id)?;
+                (entry.kind == worktree::EntryKind::UnloadedDir).then_some(entry.path.clone())
+            })
+            .collect::<HashSet<_>>();
+        if unloaded_directories.is_empty() {
+            return;
+        }
+
+        let buffers_to_refresh = this
+            .path_to_buffer_id
+            .iter()
+            .filter_map(|(project_path, buffer_id)| {
+                if project_path.worktree_id != snapshot.id()
+                    || !project_path
+                        .path
+                        .ancestors()
+                        .skip(1)
+                        .any(|ancestor| unloaded_directories.contains(ancestor))
+                {
+                    return None;
+                }
+                let buffer = this.get(*buffer_id)?;
+                let file = File::from_dyn(buffer.read(cx).file())?;
+                Some((project_path.path.clone(), file.entry_id?))
+            })
+            .collect::<Vec<_>>();
+        if buffers_to_refresh.is_empty() {
+            return;
+        }
+
+        let Some(worktree) = worktree_handle.read(cx).as_local() else {
+            return;
+        };
+        let mut refresh = worktree.refresh_entries_for_paths(
+            buffers_to_refresh
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect(),
+        );
+        let worktree_handle = worktree_handle.clone();
+        cx.spawn(async move |this, cx| {
+            refresh.next().await;
+            this.update(cx, |this, cx| {
+                let snapshot = worktree_handle.read(cx).snapshot();
+                for (path, entry_id) in buffers_to_refresh {
+                    Self::local_worktree_entry_changed(
+                        this,
+                        entry_id,
+                        &path,
+                        &worktree_handle,
+                        &snapshot,
+                        cx,
+                    );
+                }
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     fn local_worktree_entry_changed(

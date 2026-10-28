@@ -8942,6 +8942,191 @@ async fn test_save_file_spawns_language_server(cx: &mut gpui::TestAppContext) {
     });
 }
 
+#[gpui::test]
+async fn test_gitignored_file_reloads_after_external_atomic_save(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({ ".git": {}, ".gitignore": ".env\n", ".env": "INITIAL=1" }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/.env"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let read_dir_count = fs.read_dir_call_count();
+
+    fs.atomic_write(path!("/dir/.env").into(), "REPLACED=2".into())
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| assert_eq!(buffer.text(), "REPLACED=2"));
+
+    fs.write(path!("/dir/.env").as_ref(), b"EDITED=3")
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "EDITED=3");
+        assert!(!buffer.is_dirty());
+    });
+    assert_eq!(fs.read_dir_call_count(), read_dir_count);
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_open_buffer_reloads_after_ignored_directory_is_recreated(
+    cx: &mut gpui::TestAppContext,
+) {
+    check_open_buffer_after_ignored_directory_is_recreated(false, cx).await;
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_dirty_buffer_survives_ignored_directory_recreation(cx: &mut gpui::TestAppContext) {
+    check_open_buffer_after_ignored_directory_is_recreated(true, cx).await;
+}
+
+async fn check_open_buffer_after_ignored_directory_is_recreated(
+    dirty: bool,
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            ".git": {},
+            ".gitignore": "generated/\n",
+            "generated": {
+                "nested": { "file.txt": "original" },
+                "unopened": { "deep": { "file.txt": "unrelated" } }
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/generated/nested/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let read_dir_count = fs.read_dir_call_count();
+    fs.write(path!("/dir/generated/nested/file.txt").as_ref(), b"edited")
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| assert_eq!(buffer.text(), "edited"));
+    assert_eq!(fs.read_dir_call_count(), read_dir_count);
+
+    if dirty {
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unsaved ")], None, cx);
+        });
+    }
+
+    fs.remove_dir(
+        path!("/dir/generated").as_ref(),
+        fs::RemoveOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.file().unwrap().disk_state(), DiskState::Deleted);
+    });
+
+    fs.insert_tree(
+        path!("/dir/generated"),
+        json!({
+            "nested": { "file.txt": "regenerated" },
+            "unopened": { "deep": { "file.txt": "unrelated" } }
+        }),
+    )
+    .await;
+    cx.run_until_parked();
+    buffer.read_with(cx, |buffer, _| {
+        assert_matches!(
+            buffer.file().unwrap().disk_state(),
+            DiskState::Present { .. }
+        );
+        if dirty {
+            assert_eq!(buffer.text(), "unsaved edited");
+            assert!(buffer.has_conflict());
+        } else {
+            assert_eq!(buffer.text(), "regenerated");
+            assert!(!buffer.is_dirty());
+        }
+    });
+
+    fs.write(
+        path!("/dir/generated/nested/file.txt").as_ref(),
+        b"edited again",
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    if dirty {
+        buffer.update(cx, |buffer, cx| {
+            assert_eq!(buffer.text(), "unsaved edited");
+            buffer.undo(cx);
+        });
+        cx.run_until_parked();
+    }
+    buffer.read_with(cx, |buffer, _| assert_eq!(buffer.text(), "edited again"));
+
+    let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("generated/unopened/deep/file.txt"))
+                .is_none()
+        );
+    });
+
+    let read_dir_count = fs.read_dir_call_count();
+    let metadata_count = fs.metadata_call_count();
+    let unopened_path = Path::new(path!("/dir/generated/unopened/deep/file.txt"));
+    fs.write(unopened_path, b"noise").await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(fs.read_dir_call_count(), read_dir_count);
+    // The scanner checks event ancestors for Git metadata before filtering
+    // unloaded paths. Refreshing open buffers must not add any other I/O.
+    assert_eq!(
+        fs.metadata_call_count() - metadata_count,
+        unopened_path.ancestors().count()
+    );
+
+    drop(buffer);
+    cx.run_until_parked();
+    fs.remove_dir(
+        path!("/dir/generated").as_ref(),
+        fs::RemoveOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    let read_dir_count = fs.read_dir_call_count();
+    fs.insert_tree(
+        path!("/dir/generated"),
+        json!({ "nested": { "file.txt": "closed" } }),
+    )
+    .await;
+    cx.run_until_parked();
+    assert_eq!(fs.read_dir_call_count(), read_dir_count);
+}
+
 #[gpui::test(iterations = 30)]
 async fn test_file_changes_multiple_times_on_disk(cx: &mut gpui::TestAppContext) {
     init_test(cx);
